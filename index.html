@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;1,100;1,200;1,300;1,400;1,500;1,600;1,700&display=swap" rel="stylesheet">
+
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+        font-family: 'IBM Plex Sans Condensed', sans-serif;
+    }
+
+    #container {
+        width: 100vw;
+        height: 100vh;  /* overridden in mobile mode by JS */
+    }
+
+    svg {
+        display: block;
+        width: 100%;
+        height: 100%;   /* overridden in mobile mode by JS */
+        shape-rendering: geometricPrecision;
+        #background-image: url("background.jpg");
+        background-color: #FDFAF6;
+        background-size: cover;
+        touch-action: manipulation;
+    }
+
+    .shadow {
+        filter: drop-shadow(0px 0px 2px rgba(0,0,0,.6));
+    }
+
+    #popupcontext {
+        position: fixed;
+        background-color: #DDDAD6;
+        width: min(240px, 85vw);
+        height: auto;
+        min-height: 140px;
+        border-radius: 20px;
+        border: 1px solid darkslategray;
+        padding: 8px;
+        opacity: 0;
+        display: block;
+        pointer-events: auto;
+    }
+
+    #plink {
+        display: block;
+        margin-top: 6px;
+        font-size: 14px;
+    }
+</style>
+</head>
+
+<body>
+
+<div id="container"></div>
+
+<div id="popupcontext">
+    <div>
+        <table><tr>
+            <td><img id="plogo" src="circle doing.png" style="width:44px; position:relative; left:-5px;"></td>
+            <td><span id="ptitle" style="position:relative; left:-8px;"></span></td>
+        </tr></table>
+    </div>
+    <div id="pdesc" style="font-size:13px; position:relative; top:-4px;"></div>
+    <div><a id="plink" href="">More Information</a></div>
+</div>
+
+<script src="rough.js"></script>
+
+<script type="module">
+import * as d3 from "https://cdn.jsdelivr.net/npm/d3@7/+esm";
+
+// ── Colour constants ────────────────────────────────────────────────────────
+// Index order: Being=0, Connecting=1, Doing=2, Knowing=3
+const darkcolours  = ["#601A5E", "#134E7F", "#9C0C0C", "#A88800"];
+const lightcolours = ["#92278F", "#1C75BC", "#EE2524", "#EABD00"];
+const containercolour = "#3C1B5E";
+
+// ── Size constants ──────────────────────────────────────────────────────────
+const RADIUS         = 44;
+const CONTAINER_DIAM = RADIUS * 2.5 * 2;       // 220px — outer B1/B2 circle
+const CONTAINER_RAD  = CONTAINER_DIAM / 2;     // 110px
+const PACK_AREA      = CONTAINER_DIAM * 0.82;  // inner area for d3.pack
+const CM_FIXED_W     = 320;                    // cultural model image: always this wide
+const CM_REPEL_R     = 155;                    // cultural model exclusion zone radius
+const DESKTOP_BREAK  = 1200;                   // px — switch to mobile layout below this
+
+// ── Mobile band definitions (group order = scroll order) ───────────────────
+const MOBILE_BAND_DEFS = [
+    { group: 'B',  label: 'Ways of Being',      file: 'circle being.png',      col: darkcolours[0], h: 580 },
+    { group: 'K',  label: 'Ways of Knowing',    file: 'circle knowing.png',    col: darkcolours[3], h: 360 },
+    { group: 'C',  label: 'Ways of Connecting', file: 'circle connecting.png', col: darkcolours[1], h: 280 },
+    { group: 'CD', label: 'Connecting & Doing', file: null,                    col: '#666',         h: 160 },
+    { group: 'D',  label: 'Ways of Doing',      file: 'circle doing.png',      col: darkcolours[2], h: 310 },
+];
+
+// ── Live state ──────────────────────────────────────────────────────────────
+let W, H;
+let mobileBands = null;   // computed in mobile mode
+let currentMode = null;   // 'desktop' | 'mobile'
+let simulation, csvData;
+let popupopen = false;
+
+// ── SVG scaffold ────────────────────────────────────────────────────────────
+const containerEl = document.getElementById('container');
+const svg         = d3.select('#container').append('svg');
+const svgNode     = svg.node();
+const rc          = rough.svg(svgNode);
+const defs        = svg.append('defs');
+const staticLayer = svg.append('g').attr('id', 'static-layer');
+const nodeLayer   = svg.append('g').attr('id', 'node-layer');
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+function getDims() {
+    return { W: containerEl.clientWidth, H: containerEl.clientHeight };
+}
+
+function isDesktop() { return W >= DESKTOP_BREAK; }
+
+function getColour(rec, dark) {
+    const idx = { B: 0, C: 1, D: 2, K: 3 }[rec.charAt(0)];
+    if (idx !== undefined) return dark ? darkcolours[idx] : lightcolours[idx];
+    return dark ? '#336' : '#aaf';
+}
+
+// ── Centroid calculation ────────────────────────────────────────────────────
+// Desktop: B & K pulled inward so they don't vanish to screen edges on wide displays.
+// Mobile: each group is centred horizontally in its vertical band.
+function getCentroid(group) {
+    if (!isDesktop() && mobileBands) {
+        const band = mobileBands[group];
+        return band ? [W / 2, band.cy] : [W / 2, H / 2];
+    }
+    const cx   = W / 2;
+    const cy   = H / 2;
+    // Cap horizontal offset: nodes pull toward centre on very wide screens
+    const xOff = Math.min(W * 0.30, 390);
+    const yOff = H * 0.22;
+    switch (group) {
+        case 'B':  return [cx - xOff, cy - yOff];
+        case 'K':  return [cx + xOff, cy - yOff];
+        case 'C':  return [cx - xOff, cy + yOff * 0.80];
+        case 'D':  return [cx + xOff, cy + yOff * 0.80];
+        case 'CD': return [cx,         cy + yOff * 0.95];
+        default:   return [cx, cy];
+    }
+}
+
+// ── Mobile band layout ──────────────────────────────────────────────────────
+function computeMobileBands() {
+    const PAD_TOP = 55;
+    let y = PAD_TOP;
+    const result = { _bands: [] };
+    MOBILE_BAND_DEFS.forEach(b => {
+        result[b.group] = { top: y, cy: y + b.h / 2, h: b.h,
+                            label: b.label, file: b.file, col: b.col };
+        result._bands.push({ group: b.group, ...result[b.group] });
+        y += b.h;
+    });
+    result._totalH = y + 50;
+    return result;
+}
+
+// ── Apply layout mode to DOM ────────────────────────────────────────────────
+function applyLayoutMode(mode) {
+    if (mode === 'mobile') {
+        const totalH = mobileBands._totalH;
+        document.body.style.overflowY = 'auto';
+        document.body.style.overflowX = 'hidden';
+        containerEl.style.height      = totalH + 'px';
+        svgNode.style.height          = totalH + 'px';
+    } else {
+        document.body.style.overflowY = 'hidden';
+        document.body.style.overflowX = 'hidden';
+        containerEl.style.height      = '100vh';
+        svgNode.style.height          = '100%';
+    }
+}
+
+// ── Static graphics ─────────────────────────────────────────────────────────
+function drawStaticGraphics() {
+    staticLayer.selectAll('*').remove();
+    defs.selectAll('filter').remove();
+
+    if (isDesktop()) {
+        drawDesktopStatics();
+    } else {
+        drawMobileStatics();
+    }
+}
+
+function drawDesktopStatics() {
+    // Cultural model — fixed pixel size, centred
+    staticLayer.append('image')
+        .attr('href', './culturalmodel.png')
+        .attr('width',  CM_FIXED_W)
+        .attr('class',  'shadow')
+        .attr('x',  (W - CM_FIXED_W) / 2)
+        .attr('y',   H / 2 - CM_FIXED_W * 0.55);
+
+    // Corner logos — image and text both centred under the group icon
+    const lw = Math.min(72, W * 0.054);
+    const logos = [
+        { label: 'Ways of Being',      file: 'circle being.png',      tx: 18,          ty: 10,      col: darkcolours[0], fid: 'fdsB' },
+        { label: 'Ways of Connecting', file: 'circle connecting.png',  tx: 18,          ty: H - 108, col: darkcolours[1], fid: 'fdsC' },
+        { label: 'Ways of Doing',      file: 'circle doing.png',       tx: W - lw - 18, ty: H - 108, col: darkcolours[2], fid: 'fdsD' },
+        { label: 'Ways of Knowing',    file: 'circle knowing.png',     tx: W - lw - 18, ty: 10,      col: darkcolours[3], fid: 'fdsK' },
+    ];
+
+    logos.forEach(({ label, file, tx, ty, col, fid }) => {
+        defs.append('filter').attr('id', fid)
+            .append('feDropShadow')
+            .attr('dx', 1).attr('dy', 1).attr('stdDeviation', 6)
+            .attr('flood-opacity', 1).attr('flood-color', col);
+
+        const g = staticLayer.append('g')
+            .attr('filter', `url(#${fid})`)
+            .attr('transform', `translate(${tx},${ty})`);
+
+        // Image anchored at x=0; centre is lw/2
+        g.append('image').attr('href', `./${file}`).attr('width', lw);
+
+        // Text centred under the image
+        g.append('text')
+            .text(label)
+            .attr('x',    lw / 2)
+            .attr('y',    lw + 15)
+            .attr('fill', col)
+            .attr('font-size',   '8.5pt')
+            .attr('font-weight', 'bold')
+            .attr('text-anchor', 'middle');
+    });
+}
+
+function drawMobileStatics() {
+    if (!mobileBands) return;
+
+    mobileBands._bands.forEach((band, i) => {
+        // Separator line above each band (skip first)
+        if (i > 0) {
+            staticLayer.append('line')
+                .attr('x1', 0).attr('x2', W)
+                .attr('y1', band.top).attr('y2', band.top)
+                .attr('stroke', 'rgba(255,255,255,0.25)')
+                .attr('stroke-width', 1);
+        }
+
+        // Group label at top of band
+        const labelY = band.top + 30;
+
+        if (band.file) {
+            const iconW = 28;
+            const totalW = iconW + 8 + 120; // rough estimate; centre on W/2
+            const startX = W / 2 - totalW / 2;
+
+            staticLayer.append('image')
+                .attr('href', `./${band.file}`)
+                .attr('width', iconW)
+                .attr('x', startX)
+                .attr('y', labelY - iconW * 0.75);
+        }
+
+        staticLayer.append('text')
+            .text(band.label)
+            .attr('x',    W / 2 + (band.file ? 18 : 0))
+            .attr('y',    labelY)
+            .attr('fill', band.col)
+            .attr('font-size',   '11pt')
+            .attr('font-weight', 'bold')
+            .attr('text-anchor', 'middle');
+    });
+}
+
+// ── Build simulation nodes from CSV ─────────────────────────────────────────
+function buildSimNodes(data) {
+    const nodes  = [];
+    const b1ch   = data.filter(d => d.Container === 'In' && d.id.startsWith('B1'));
+    const b2ch   = data.filter(d => d.Container === 'In' && d.id.startsWith('B2'));
+
+    data.forEach((d, i) => {
+        if (d.Container === 'In') return;   // rendered inside super-nodes
+
+        const isSuper  = d.Container === 'Yes';
+        const isSplit  = d.Recommendation.includes('/');
+        const group    = isSplit ? 'CD' : isSuper ? 'B' : d.id[0];
+        const children = isSuper ? (d.id === 'B1' ? b1ch : b2ch) : [];
+
+        // Starting position: near group centroid with small jitter
+        const [cx0, cy0] = getCentroid(group);
+        const jitter = 40;
+
+        nodes.push({
+            csvIndex:  i,
+            id:        d.id,
+            Recommendation: d.Recommendation,
+            group, isSuper, isSplit, children,
+            x: cx0 + (Math.random() - 0.5) * jitter,
+            y: cy0 + (Math.random() - 0.5) * jitter,
+            simRadius: isSuper ? CONTAINER_RAD + 15 : RADIUS + 5,
+        });
+    });
+
+    return nodes;
+}
+
+// ── Draw regular leaf node into <g> at local (0, 0) ─────────────────────────
+function drawRegularNode(simNode, g) {
+    const row   = csvData[simNode.csvIndex];
+    const idx   = simNode.csvIndex;
+    const diam  = RADIUS * 2;
+    const split = simNode.isSplit;
+
+    function attach(el) {
+        el.setAttribute('data-idx', idx);
+        d3.select(el).on('pointerenter', popup).on('pointerleave', popupclose);
+        return el;
+    }
+
+    // Outer rough circle
+    g.node().appendChild(attach(rc.circle(0, 0, diam, {
+        seed: idx, roughness: 0.4, strokeWidth: 1.5,
+        fill: getColour(simNode.id, true), fillStyle: 'solid'
+    })));
+
+    // Right-half circle for C2/D4
+    if (split) {
+        const other = row.Recommendation.split('/')[1].trim();
+        defs.append('clipPath').attr('id', 'cliphalf' + simNode.id)
+            .append('rect')
+            .attr('x', 0).attr('y', -RADIUS)
+            .attr('width', RADIUS).attr('height', RADIUS * 2);
+
+        const halfEl = rc.circle(0, 0, diam, {
+            seed: idx, roughness: 0.4, strokeWidth: 1.5,
+            fill: getColour(other, true), fillStyle: 'solid'
+        });
+        halfEl.setAttribute('clip-path', 'url(#cliphalf' + simNode.id + ')');
+        g.node().appendChild(attach(halfEl));
+    }
+
+    // Fill-level indicator — left / full
+    const fillFrac = Math.max(((100 - parseFloat(row.Amount) - 4) / 100), 0);
+    const fillH    = fillFrac * RADIUS * 2;
+
+    defs.append('clipPath').attr('id', 'clip' + simNode.id)
+        .append('rect')
+        .attr('x', -RADIUS).attr('y', -RADIUS)
+        .attr('width', RADIUS * 2).attr('height', fillH);
+
+    const fillEl = rc.circle(0, 0, diam, {
+        seed: idx, roughness: 0.4, strokeWidth: 1.5,
+        fill: getColour(simNode.id, false), fillStyle: 'solid'
+    });
+    fillEl.setAttribute('clip-path', 'url(#clip' + simNode.id + ')');
+    g.node().appendChild(attach(fillEl));
+
+    // Fill-level indicator — right half, C2/D4 only
+    if (split) {
+        const other = row.Recommendation.split('/')[1].trim();
+        const p = d3.path();
+        p.moveTo(0, -RADIUS); p.lineTo(RADIUS, -RADIUS);
+        p.lineTo(RADIUS, -RADIUS + fillH); p.lineTo(0, -RADIUS + fillH);
+        p.closePath();
+
+        defs.append('clipPath').attr('id', 'clip34' + simNode.id)
+            .append('path').attr('d', p.toString());
+
+        const fillEl2 = rc.circle(0, 0, diam, {
+            seed: idx, roughness: 0.4, strokeWidth: 1.5,
+            fill: getColour(other, false), fillStyle: 'solid'
+        });
+        fillEl2.setAttribute('clip-path', 'url(#clip34' + simNode.id + ')');
+        g.node().appendChild(attach(fillEl2));
+    }
+
+    // Labels
+    g.append('text')
+        .text(row.Recommendation)
+        .attr('x', 0).attr('y', -RADIUS + 22)
+        .attr('class', 'shadow').attr('fill', 'white')
+        .attr('font-size', '12pt').attr('font-weight', 'bold')
+        .attr('text-anchor', 'middle')
+        .attr('data-idx', idx)
+        .on('pointerenter', popup).on('pointerleave', popupclose);
+
+    if (row.Label !== 'X') {
+        g.append('text')
+            .text(row.Label)
+            .attr('x', 0).attr('y', 4)
+            .attr('class', 'shadow').attr('fill', 'white')
+            .attr('font-size', '9pt').attr('text-anchor', 'middle')
+            .attr('data-idx', idx)
+            .on('pointerenter', popup).on('pointerleave', popupclose)
+            .call(wrap, RADIUS * 1.8, 0.35, 1.05, 0.99);
+    }
+}
+
+// ── Draw B1/B2 super-node into <g> at local (0, 0) ──────────────────────────
+function drawSuperNode(simNode, g) {
+    // Outer container circle
+    g.node().appendChild(rc.circle(0, 0, CONTAINER_DIAM, {
+        seed: simNode.id === 'B1' ? 200 : 201,
+        roughness: 0.3, strokeWidth: 2,
+        fill: containercolour, fillStyle: 'solid'
+    }));
+
+    // Pack children
+    const hier = d3.hierarchy({ id: simNode.id, children: simNode.children })
+        .sum(() => 1).sort((a, b) => b.value - a.value);
+    d3.pack().size([PACK_AREA, PACK_AREA]).padding(5)(hier);
+
+    const offset = PACK_AREA / 2;
+
+    hier.children.forEach(child => {
+        const cx       = child.x - offset;
+        const cy       = child.y - offset;
+        const cr       = child.r;
+        const childRow = child.data;
+        const cidx     = childRow.csvIndex;
+
+        function attachChild(el) {
+            el.setAttribute('data-idx', cidx);
+            d3.select(el).on('pointerenter', popup).on('pointerleave', popupclose);
+            return el;
+        }
+
+        // Sub outline circle
+        g.node().appendChild(attachChild(rc.circle(cx, cy, cr * 2, {
+            seed: cidx + 5, roughness: 0.4, strokeWidth: 1.5,
+            fill: getColour(childRow.id, true), fillStyle: 'solid'
+        })));
+
+        // Sub fill indicator (local coords)
+        const sfrac  = Math.max(((100 - parseFloat(childRow.Amount) - 4) / 100), 0);
+        const sfillH = sfrac * cr * 2;
+        const clipId = 'clip-sub-' + childRow.id;
+
+        defs.append('clipPath').attr('id', clipId)
+            .append('rect')
+            .attr('x', cx - cr).attr('y', cy - cr)
+            .attr('width', cr * 2).attr('height', sfillH);
+
+        const sfillEl = rc.circle(cx, cy, cr * 2, {
+            seed: cidx + 5, roughness: 0.4, strokeWidth: 1.5,
+            fill: getColour(childRow.id, false), fillStyle: 'solid'
+        });
+        sfillEl.setAttribute('clip-path', `url(#${clipId})`);
+        g.node().appendChild(attachChild(sfillEl));
+
+        // Sub-node labels
+        g.append('text')
+            .text(childRow.id)
+            .attr('x', cx).attr('y', cy - cr + 13)
+            .attr('fill', 'white')
+            .attr('font-size', '8pt').attr('font-weight', 'bold')
+            .attr('text-anchor', 'middle')
+            .attr('data-idx', cidx)
+            .on('pointerenter', popup).on('pointerleave', popupclose);
+
+        if (childRow.Label !== 'X') {
+            g.append('text')
+                .text(childRow.Label)
+                .attr('x', cx).attr('y', cy + 2)
+                .attr('fill', 'white').attr('font-size', '7pt')
+                .attr('text-anchor', 'middle')
+                .attr('data-idx', cidx)
+                .on('pointerenter', popup).on('pointerleave', popupclose)
+                .call(wrap, cr * 1.6, 0.35, 1.05, 0.95);
+        }
+    });
+
+    // Super-node ID label
+    g.append('text')
+        .text(simNode.id)
+        .attr('x', 0).attr('y', -CONTAINER_RAD + 18)
+        .attr('fill', 'white')
+        .attr('font-size', '11pt').attr('font-weight', 'bold')
+        .attr('text-anchor', 'middle');
+}
+
+// ── Create all node <g> groups ───────────────────────────────────────────────
+function initNodes(simNodes) {
+    nodeLayer.selectAll('*').remove();
+    defs.selectAll('clipPath').remove();
+
+    simNodes.forEach(simNode => {
+        const g = nodeLayer.append('g')
+            .attr('transform', `translate(${simNode.x},${simNode.y})`);
+        simNode._g = g;
+        simNode.isSuper ? drawSuperNode(simNode, g) : drawRegularNode(simNode, g);
+    });
+}
+
+// ── Cultural-model repulsion (desktop only) ──────────────────────────────────
+function makeCmRepulsion(nodes) {
+    return function(alpha) {
+        if (!isDesktop()) return;
+        const cx = W / 2, cy = H / 2;
+        for (const n of nodes) {
+            const dx = n.x - cx, dy = n.y - cy;
+            const d  = Math.hypot(dx, dy) || 1;
+            if (d < CM_REPEL_R) {
+                const push = ((CM_REPEL_R - d) / CM_REPEL_R) * alpha * 5;
+                n.vx += (dx / d) * push;
+                n.vy += (dy / d) * push;
+            }
+        }
+    };
+}
+
+// ── Force simulation ─────────────────────────────────────────────────────────
+function initSimulation(simNodes) {
+    if (simulation) simulation.stop();
+
+    simulation = d3.forceSimulation(simNodes)
+        .force('x',       d3.forceX(d => getCentroid(d.group)[0]).strength(0.3))
+        .force('y',       d3.forceY(d => getCentroid(d.group)[1]).strength(0.3))
+        .force('collide', d3.forceCollide(d => d.simRadius).strength(0.9).iterations(3))
+        .force('cmRepel', makeCmRepulsion(simNodes))
+        .on('tick', () => {
+            simNodes.forEach(d => d._g.attr('transform', `translate(${d.x},${d.y})`));
+        });
+}
+
+function updateSimForces() {
+    if (!simulation) return;
+    simulation
+        .force('x', d3.forceX(d => getCentroid(d.group)[0]).strength(0.3))
+        .force('y', d3.forceY(d => getCentroid(d.group)[1]).strength(0.3))
+        .alpha(0.3).restart();
+}
+
+// ── Popup ─────────────────────────────────────────────────────────────────────
+function popup(event) {
+    if (popupopen) return;
+
+    const idx = parseInt(event.currentTarget.getAttribute('data-idx'));
+    const d   = csvData[idx];
+
+    let title = '';
+    switch (d.Recommendation[0]) {
+        case 'C': title = 'Ways of Connecting'; d3.select('#plogo').attr('src', './circle connecting.png'); break;
+        case 'B': title = 'Ways of Being';      d3.select('#plogo').attr('src', './circle being.png');     break;
+        case 'D': title = 'Ways of Doing';      d3.select('#plogo').attr('src', './circle doing.png');     break;
+        case 'K': title = 'Ways of Knowing';    d3.select('#plogo').attr('src', './circle knowing.png');   break;
+    }
+
+    d3.select('#ptitle').text(
+        d.Recommendation.includes('/')
+            ? 'Ways of Connecting 2 and Ways of Doing 4'
+            : title + '  ' + d.Recommendation.substring(1)
+    );
+    d3.select('#pdesc').text(d.Description);
+
+    if (d.Link) {
+        d3.select('#plink').attr('href', d.Link).text('More Information');
+    } else {
+        d3.select('#plink').attr('href', '').text('');
+    }
+
+    const popupEl = document.getElementById('popupcontext');
+    const pw = popupEl.offsetWidth  || 240;
+    const ph = popupEl.offsetHeight || 200;
+    const m  = 10;
+    const left = Math.min(event.clientX, window.innerWidth  - pw - m);
+    const top  = Math.max(Math.min(event.clientY - ph - m, window.innerHeight - ph - m), m);
+
+    d3.select('#popupcontext')
+        .style('top',  top  + 'px')
+        .style('left', left + 'px')
+        .transition().delay(10).duration(400).style('opacity', 0.9);
+
+    popupopen = true;
+}
+
+function popupclose(event) {
+    if (!popupopen) return;
+    const rel     = event.relatedTarget || event.toElement;
+    const popupEl = document.getElementById('popupcontext');
+    if (rel && (rel === popupEl || popupEl.contains(rel))) return;
+
+    d3.select('#popupcontext')
+        .transition().delay(10).duration(400).style('opacity', 0.0);
+    popupopen = false;
+}
+
+// ── Full rebuild (mode switch or initial load) ───────────────────────────────
+function rebuild() {
+    if (!csvData) return;
+    drawStaticGraphics();
+    const simNodes = buildSimNodes(csvData);
+    initNodes(simNodes);
+    initSimulation(simNodes);
+}
+
+// ── Main entry point ─────────────────────────────────────────────────────────
+async function init() {
+    ({ W, H } = getDims());
+    currentMode = isDesktop() ? 'desktop' : 'mobile';
+
+    if (!isDesktop()) {
+        mobileBands = computeMobileBands();
+        applyLayoutMode('mobile');
+        ({ W, H } = getDims());
+    } else {
+        applyLayoutMode('desktop');
+    }
+
+    csvData = await d3.csv('./recommendationdata.csv');
+    csvData.forEach((d, i) => {
+        d.id       = d.Recommendation.substr(0, 3).trim();
+        d.csvIndex = i;
+    });
+
+    rebuild();
+    d3.select('#popupcontext').on('pointerleave', popupclose);
+}
+
+// ── Resize observer ────────────────────────────────────────────────────────
+new ResizeObserver(() => {
+    ({ W, H } = getDims());
+    const newMode = isDesktop() ? 'desktop' : 'mobile';
+
+    if (newMode === 'mobile') {
+        mobileBands = computeMobileBands();
+        applyLayoutMode('mobile');
+        ({ W, H } = getDims());
+    } else {
+        applyLayoutMode('desktop');
+        ({ W, H } = getDims());
+    }
+
+    if (newMode !== currentMode) {
+        // Mode switched — full rebuild with reset node positions
+        currentMode = newMode;
+        rebuild();
+    } else {
+        // Same mode — just update static graphics and reheat forces
+        drawStaticGraphics();
+        updateSimForces();
+    }
+}).observe(containerEl);
+
+init();
+
+// ── Text-wrap utility ─────────────────────────────────────────────────────────
+// from https://observablehq.com/@jtrim-ons/svg-text-wrapping
+function wrap(text, width, dyAdjust, lineHeightEms, lineHeightSquishFactor, splitOnHyphen, centreVertically) {
+    if (!lineHeightEms)           lineHeightEms = 1.05;
+    if (!lineHeightSquishFactor)  lineHeightSquishFactor = 1;
+    if (splitOnHyphen  == null)   splitOnHyphen = true;
+    if (centreVertically == null) centreVertically = true;
+
+    text.each(function() {
+        var text = d3.select(this),
+            x    = text.attr('x'),
+            y    = text.attr('y');
+
+        var words = [];
+        text.text().split(/\s+/).forEach(function(w) {
+            if (splitOnHyphen) {
+                var sub = w.split('-');
+                for (var i = 0; i < sub.length - 1; i++) words.push(sub[i] + '-');
+                words.push(sub[sub.length - 1] + ' ');
+            } else {
+                words.push(w + ' ');
+            }
+        });
+
+        text.text(null);
+        var tspan = text.append('tspan');
+        var line = '', prevLine = '', nWords = 0;
+
+        for (var i = 0; i < words.length; i++) {
+            var word = words[i];
+            prevLine = line;
+            line += word;
+            ++nWords;
+            tspan.text(line.trim());
+            if (tspan.node().getComputedTextLength() > width && nWords > 1) {
+                tspan.text(prevLine.trim());
+                prevLine = ''; line = word; nWords = 1;
+                tspan = text.append('tspan').text(word.trim());
+            }
+        }
+
+        var tspans = text.selectAll('tspan');
+        var h = lineHeightEms;
+        if (tspans.size() > 2)
+            for (var i = 0; i < tspans.size(); i++) h *= lineHeightSquishFactor;
+
+        tspans.each(function(d, i) {
+            var dy = i * h + dyAdjust;
+            if (centreVertically) dy -= ((tspans.size() - 1) * h) / 2;
+            d3.select(this).attr('y', y).attr('x', x).attr('dy', dy + 'em');
+        }).attr('text-anchor', 'middle');
+    });
+}
+
+</script>
+</body>
