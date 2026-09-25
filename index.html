@@ -10,11 +10,14 @@
 
     body {
         font-family: 'IBM Plex Sans Condensed', sans-serif;
+        background-color: #FDFAF6;
     }
 
     #container {
         width: 100vw;
         height: 100vh;  /* overridden in mobile mode by JS */
+        position: relative;
+        z-index: 1;
     }
 
     svg {
@@ -22,10 +25,21 @@
         width: 100%;
         height: 100%;   /* overridden in mobile mode by JS */
         shape-rendering: geometricPrecision;
-        #background-image: url("background.jpg");
-        background-color: #FDFAF6;
-        background-size: cover;
         touch-action: manipulation;
+    }
+
+    /* Mobile-only cultural-model watermark: fixed to the viewport so it stays
+       centred in place while the page scrolls underneath it. */
+    #cmWatermark {
+        display: none;
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: min(62vw, 300px);
+        opacity: 0.45;
+        pointer-events: none;
+        z-index: 0;
     }
 
     .shadow {
@@ -34,6 +48,7 @@
 
     #popupcontext {
         position: fixed;
+        z-index: 10;
         background-color: #DDDAD6;
         width: min(240px, 85vw);
         height: auto;
@@ -58,6 +73,8 @@
 
 <div id="container"></div>
 
+<img id="cmWatermark" src="./culturalmodel.png" alt="" aria-hidden="true">
+
 <div id="popupcontext">
     <div>
         <table><tr>
@@ -80,21 +97,55 @@ const darkcolours  = ["#601A5E", "#134E7F", "#9C0C0C", "#A88800"];
 const lightcolours = ["#92278F", "#1C75BC", "#EE2524", "#EABD00"];
 const containercolour = "#3C1B5E";
 
+// Intrinsic aspect ratio (height ÷ width) of each corner-icon PNG. These are
+// non-square source images, so the <image> height must always be set
+// explicitly from a known ratio rather than left to auto-size from the
+// (asynchronously loaded) source file — otherwise any code that measures the
+// icon's rendered bounding box (e.g. the header border below) can run before
+// the image has decoded and read a wrong, pre-load box.
+const ICON_ASPECT = {
+    'circle being.png':      284 / 422,
+    'circle knowing.png':    303 / 345,
+    'circle connecting.png': 432 / 397,
+    'circle doing.png':      456 / 489,
+};
+
 // ── Size constants ──────────────────────────────────────────────────────────
 const RADIUS         = 44;
-const CONTAINER_DIAM = RADIUS * 2.5 * 2;       // 220px — outer B1/B2 circle
-const CONTAINER_RAD  = CONTAINER_DIAM / 2;     // 110px
-const PACK_AREA      = CONTAINER_DIAM * 0.82;  // inner area for d3.pack
+// B1/B2's 4 children sit in a 2×2 grid (see gridLayoutChildren) sized at
+// RADIUS each, matching regular leaf nodes. CONTAINER_RAD is derived — not
+// hardcoded — so the outer ring just hugs that grid (diagonal centre-to-far-
+// edge distance) plus a fixed clearance, rather than being arbitrarily huge.
+const SUPER_CHILD_GAP = 6;     // gap between adjacent B1/B2 children
+const SUPER_MARGIN    = 20;    // clearance between children and the outer ring
+const CONTAINER_RAD   = Math.SQRT2 * (RADIUS + SUPER_CHILD_GAP / 2) + RADIUS + SUPER_MARGIN;  // ~130px
+const CONTAINER_DIAM  = CONTAINER_RAD * 2;                                                    // ~261px
 const CM_FIXED_W     = 320;                    // cultural model image: always this wide
 const CM_REPEL_R     = 155;                    // cultural model exclusion zone radius
 const DESKTOP_BREAK  = 1200;                   // px — switch to mobile layout below this
+const LAYOUT_SEED    = 42;                     // fixed seed — same starting layout every load
+const SIM_FREEZE_MS  = 2000;                   // stop the force simulation after this long
+
+// Deterministic PRNG (mulberry32) so node starting positions — and therefore
+// where the simulation settles — are stable across reloads instead of
+// jittering to a different layout every time.
+function mulberry32(seed) {
+    return function() {
+        seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
 
 // ── Mobile band definitions (group order = scroll order) ───────────────────
 const MOBILE_BAND_DEFS = [
-    { group: 'B',  label: 'Ways of Being',      file: 'circle being.png',      col: darkcolours[0], h: 580 },
+    // Tall enough for B1 and B2 (~CONTAINER_DIAM containers, stacked in their
+    // own slots — see getCentroid) plus B3/B4 without bleeding into the next band.
+    { group: 'B',  label: 'Ways of Being',      file: 'circle being.png',      col: darkcolours[0], h: 700 },
     { group: 'K',  label: 'Ways of Knowing',    file: 'circle knowing.png',    col: darkcolours[3], h: 360 },
     { group: 'C',  label: 'Ways of Connecting', file: 'circle connecting.png', col: darkcolours[1], h: 280 },
-    { group: 'CD', label: 'Connecting & Doing', file: null,                    col: '#666',         h: 160 },
+    { group: 'CD', label: null,                 file: null,                    col: '#666',         h: 160 },
     { group: 'D',  label: 'Ways of Doing',      file: 'circle doing.png',      col: darkcolours[2], h: 310 },
 ];
 
@@ -103,16 +154,19 @@ let W, H;
 let mobileBands = null;   // computed in mobile mode
 let currentMode = null;   // 'desktop' | 'mobile'
 let simulation, csvData;
+let simFreezeTimer = null;   // pending "stop the simulation" timeout
 let popupopen = false;
 
 // ── SVG scaffold ────────────────────────────────────────────────────────────
-const containerEl = document.getElementById('container');
+const containerEl   = document.getElementById('container');
+const cmWatermarkEl = document.getElementById('cmWatermark');
 const svg         = d3.select('#container').append('svg');
 const svgNode     = svg.node();
 const rc          = rough.svg(svgNode);
 const defs        = svg.append('defs');
 const staticLayer = svg.append('g').attr('id', 'static-layer');
 const nodeLayer   = svg.append('g').attr('id', 'node-layer');
+const topLayer    = svg.append('g').attr('id', 'top-layer');   // always above nodes (mobile band headers)
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 function getDims() {
@@ -130,10 +184,24 @@ function getColour(rec, dark) {
 // ── Centroid calculation ────────────────────────────────────────────────────
 // Desktop: B & K pulled inward so they don't vanish to screen edges on wide displays.
 // Mobile: each group is centred horizontally in its vertical band.
-function getCentroid(group) {
+// `node` may be a plain group letter (string) or a sim node object — B1/B2
+// need their own identity on mobile (see below), everything else only needs
+// the group.
+function getCentroid(node) {
+    const group = typeof node === 'string' ? node : node.group;
     if (!isDesktop() && mobileBands) {
         const band = mobileBands[group];
-        return band ? [W / 2, band.cy] : [W / 2, H / 2];
+        if (!band) return [W / 2, H / 2];
+        // B1 and B2 are now as big as the 'B' band is tall (see CONTAINER_DIAM);
+        // pulling both toward the band's single centre point makes collision
+        // shove them apart sideways, off the edge of a narrow phone screen.
+        // Give each its own vertical slot instead so they stack.
+        if (typeof node !== 'string' && node.isSuper) {
+            const slotCy = node.id === 'B1' ? band.top + band.h * 0.25
+                                             : band.top + band.h * 0.75;
+            return [W / 2, slotCy];
+        }
+        return [W / 2, band.cy];
     }
     const cx   = W / 2;
     const cy   = H / 2;
@@ -141,7 +209,10 @@ function getCentroid(group) {
     const xOff = Math.min(W * 0.30, 390);
     const yOff = H * 0.22;
     switch (group) {
-        case 'B':  return [cx - xOff, cy - yOff];
+        // B pulls up less than K: B1/B2's ring + external label make the
+        // whole cluster tall enough that the full yOff crowds it against
+        // the top of the viewport (the label was getting clipped off).
+        case 'B':  return [cx - xOff, cy - yOff * 0.6];
         case 'K':  return [cx + xOff, cy - yOff];
         case 'C':  return [cx - xOff, cy + yOff * 0.80];
         case 'D':  return [cx + xOff, cy + yOff * 0.80];
@@ -173,17 +244,20 @@ function applyLayoutMode(mode) {
         document.body.style.overflowX = 'hidden';
         containerEl.style.height      = totalH + 'px';
         svgNode.style.height          = totalH + 'px';
+        cmWatermarkEl.style.display   = 'block';
     } else {
         document.body.style.overflowY = 'hidden';
         document.body.style.overflowX = 'hidden';
         containerEl.style.height      = '100vh';
         svgNode.style.height          = '100%';
+        cmWatermarkEl.style.display   = 'none';
     }
 }
 
 // ── Static graphics ─────────────────────────────────────────────────────────
 function drawStaticGraphics() {
     staticLayer.selectAll('*').remove();
+    topLayer.selectAll('*').remove();
     defs.selectAll('filter').remove();
 
     if (isDesktop()) {
@@ -203,12 +277,13 @@ function drawDesktopStatics() {
         .attr('y',   H / 2 - CM_FIXED_W * 0.55);
 
     // Corner logos — image and text both centred under the group icon
-    const lw = Math.min(72, W * 0.054);
+    const lw     = Math.min(72, W * 0.054);
+    const inset  = 20;   // pulls the logos in from the raw viewport edge
     const logos = [
-        { label: 'Ways of Being',      file: 'circle being.png',      tx: 18,          ty: 10,      col: darkcolours[0], fid: 'fdsB' },
-        { label: 'Ways of Connecting', file: 'circle connecting.png',  tx: 18,          ty: H - 108, col: darkcolours[1], fid: 'fdsC' },
-        { label: 'Ways of Doing',      file: 'circle doing.png',       tx: W - lw - 18, ty: H - 108, col: darkcolours[2], fid: 'fdsD' },
-        { label: 'Ways of Knowing',    file: 'circle knowing.png',     tx: W - lw - 18, ty: 10,      col: darkcolours[3], fid: 'fdsK' },
+        { label: 'Ways of Being',      file: 'circle being.png',      tx: 18 + inset,          ty: 10 + inset,      col: darkcolours[0], fid: 'fdsB' },
+        { label: 'Ways of Connecting', file: 'circle connecting.png',  tx: 18 + inset,          ty: H - 108 - inset, col: darkcolours[1], fid: 'fdsC' },
+        { label: 'Ways of Doing',      file: 'circle doing.png',       tx: W - lw - 18 - inset, ty: H - 108 - inset, col: darkcolours[2], fid: 'fdsD' },
+        { label: 'Ways of Knowing',    file: 'circle knowing.png',     tx: W - lw - 18 - inset, ty: 10 + inset,      col: darkcolours[3], fid: 'fdsK' },
     ];
 
     logos.forEach(({ label, file, tx, ty, col, fid }) => {
@@ -222,15 +297,16 @@ function drawDesktopStatics() {
             .attr('transform', `translate(${tx},${ty})`);
 
         // Image anchored at x=0; centre is lw/2
-        g.append('image').attr('href', `./${file}`).attr('width', lw);
+        g.append('image').attr('href', `./${file}`)
+            .attr('width', lw).attr('height', lw * ICON_ASPECT[file]);
 
-        // Text centred under the image
+        // Text centred under the image — sized to match the mobile band headers
         g.append('text')
             .text(label)
             .attr('x',    lw / 2)
-            .attr('y',    lw + 15)
+            .attr('y',    lw + 18)
             .attr('fill', col)
-            .attr('font-size',   '8.5pt')
+            .attr('font-size',   '13pt')
             .attr('font-weight', 'bold')
             .attr('text-anchor', 'middle');
     });
@@ -238,6 +314,9 @@ function drawDesktopStatics() {
 
 function drawMobileStatics() {
     if (!mobileBands) return;
+
+    // Cultural-model watermark is a fixed HTML overlay (#cmWatermark), not
+    // drawn into the SVG, so it stays centred in the viewport while scrolling.
 
     mobileBands._bands.forEach((band, i) => {
         // Separator line above each band (skip first)
@@ -249,35 +328,66 @@ function drawMobileStatics() {
                 .attr('stroke-width', 1);
         }
 
-        // Group label at top of band
-        const labelY = band.top + 30;
-
-        if (band.file) {
-            const iconW = 28;
-            const totalW = iconW + 8 + 120; // rough estimate; centre on W/2
-            const startX = W / 2 - totalW / 2;
-
-            staticLayer.append('image')
-                .attr('href', `./${band.file}`)
-                .attr('width', iconW)
-                .attr('x', startX)
-                .attr('y', labelY - iconW * 0.75);
-        }
-
-        staticLayer.append('text')
-            .text(band.label)
-            .attr('x',    W / 2 + (band.file ? 18 : 0))
-            .attr('y',    labelY)
-            .attr('fill', band.col)
-            .attr('font-size',   '11pt')
-            .attr('font-weight', 'bold')
-            .attr('text-anchor', 'middle');
+        // Connecting & Doing has no header — its split-fill node signals the
+        // hybrid state on its own, so it just hangs in the gap between bands.
+        if (band.label) addMobileHeader(band);
     });
+}
+
+// Band header — icon + label, left-aligned, on an opaque plate, drawn in
+// topLayer so it always sits above any node that scrolls underneath it.
+// Glows in the section's colour, matching the desktop corner headers.
+function addMobileHeader(band) {
+    const iconW     = Math.min(64, W * 0.16);
+    const iconH     = iconW * ICON_ASPECT[band.file];
+    const padLeft   = 16;
+    const headerCY  = band.top + iconH / 2 + 14;
+
+    const fid = 'fdsMobile' + band.group;
+    defs.append('filter').attr('id', fid)
+        .append('feDropShadow')
+        .attr('dx', 1).attr('dy', 1).attr('stdDeviation', 6)
+        .attr('flood-opacity', 1).attr('flood-color', band.col);
+
+    const g = topLayer.append('g')
+        .attr('class', 'mobile-header')
+        .attr('filter', `url(#${fid})`);
+
+    g.append('image')
+        .attr('href', `./${band.file}`)
+        .attr('width', iconW).attr('height', iconH)
+        .attr('x', padLeft)
+        .attr('y', headerCY - iconH / 2);
+
+    g.append('text')
+        .text(band.label)
+        .attr('x', padLeft + iconW + 10)
+        .attr('y', headerCY + 5)
+        .attr('fill', band.col)
+        .attr('font-size',   '13pt')
+        .attr('font-weight', 'bold')
+        .attr('text-anchor', 'start');
+
+    // Opaque backing plate sized to fit the icon + text, inserted behind them
+    const bbox  = g.node().getBBox();
+    const padX  = 14, padY = 10;
+    const plateX = bbox.x - padX,          plateY = bbox.y - padY;
+    const plateW = bbox.width + padX * 2,  plateH = bbox.height + padY * 2;
+
+    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    rect.setAttribute('x', plateX);
+    rect.setAttribute('y', plateY);
+    rect.setAttribute('width',  plateW);
+    rect.setAttribute('height', plateH);
+    rect.setAttribute('rx', 10);
+    rect.setAttribute('fill', 'rgba(253,250,246,0.85)');
+    g.node().insertBefore(rect, g.node().firstChild);
 }
 
 // ── Build simulation nodes from CSV ─────────────────────────────────────────
 function buildSimNodes(data) {
     const nodes  = [];
+    const rng    = mulberry32(LAYOUT_SEED);   // same sequence every rebuild — stable layout
     const b1ch   = data.filter(d => d.Container === 'In' && d.id.startsWith('B1'));
     const b2ch   = data.filter(d => d.Container === 'In' && d.id.startsWith('B2'));
 
@@ -290,7 +400,7 @@ function buildSimNodes(data) {
         const children = isSuper ? (d.id === 'B1' ? b1ch : b2ch) : [];
 
         // Starting position: near group centroid with small jitter
-        const [cx0, cy0] = getCentroid(group);
+        const [cx0, cy0] = getCentroid({ group, isSuper, id: d.id });
         const jitter = 40;
 
         nodes.push({
@@ -298,8 +408,8 @@ function buildSimNodes(data) {
             id:        d.id,
             Recommendation: d.Recommendation,
             group, isSuper, isSplit, children,
-            x: cx0 + (Math.random() - 0.5) * jitter,
-            y: cy0 + (Math.random() - 0.5) * jitter,
+            x: cx0 + (rng() - 0.5) * jitter,
+            y: cy0 + (rng() - 0.5) * jitter,
             simRadius: isSuper ? CONTAINER_RAD + 15 : RADIUS + 5,
         });
     });
@@ -399,6 +509,24 @@ function drawRegularNode(simNode, g) {
     }
 }
 
+// Arrange a super-node's children in a compact square grid, centred on
+// (0, 0). Far more area-efficient than d3.pack's circular packing for a
+// handful of equal-sized circles — pack inscribes them in a circle and
+// leaves the square's corners empty, which is what forced B1/B2's outer
+// ring to be so much bigger than the children actually needed.
+function gridLayoutChildren(children, r, gap) {
+    const cols = Math.ceil(Math.sqrt(children.length));
+    const rows = Math.ceil(children.length / cols);
+    const cell = r * 2 + gap;
+    const offX = (cols - 1) * cell / 2;
+    const offY = (rows - 1) * cell / 2;
+    return children.map((data, i) => ({
+        x: (i % cols) * cell - offX,
+        y: Math.floor(i / cols) * cell - offY,
+        r, data
+    }));
+}
+
 // ── Draw B1/B2 super-node into <g> at local (0, 0) ──────────────────────────
 function drawSuperNode(simNode, g) {
     // Outer container circle
@@ -408,16 +536,11 @@ function drawSuperNode(simNode, g) {
         fill: containercolour, fillStyle: 'solid'
     }));
 
-    // Pack children
-    const hier = d3.hierarchy({ id: simNode.id, children: simNode.children })
-        .sum(() => 1).sort((a, b) => b.value - a.value);
-    d3.pack().size([PACK_AREA, PACK_AREA]).padding(5)(hier);
+    const packedChildren = gridLayoutChildren(simNode.children, RADIUS, SUPER_CHILD_GAP);
 
-    const offset = PACK_AREA / 2;
-
-    hier.children.forEach(child => {
-        const cx       = child.x - offset;
-        const cy       = child.y - offset;
+    packedChildren.forEach(child => {
+        const cx       = child.x;
+        const cy       = child.y;
         const cr       = child.r;
         const childRow = child.data;
         const cidx     = childRow.csvIndex;
@@ -473,12 +596,13 @@ function drawSuperNode(simNode, g) {
         }
     });
 
-    // Super-node ID label
+    // Super-node ID label — shifted above the ring instead of stealing
+    // headroom from inside it, so the children can use the full circle.
     g.append('text')
         .text(simNode.id)
-        .attr('x', 0).attr('y', -CONTAINER_RAD + 18)
-        .attr('fill', 'white')
-        .attr('font-size', '11pt').attr('font-weight', 'bold')
+        .attr('x', 0).attr('y', -CONTAINER_RAD - 12)
+        .attr('fill', containercolour)
+        .attr('font-size', '12pt').attr('font-weight', 'bold')
         .attr('text-anchor', 'middle');
 }
 
@@ -513,25 +637,40 @@ function makeCmRepulsion(nodes) {
 }
 
 // ── Force simulation ─────────────────────────────────────────────────────────
+// Nodes settle and then the simulation is stopped outright after SIM_FREEZE_MS,
+// so positions hold still rather than drifting/jittering indefinitely.
+function armFreezeTimer() {
+    if (simFreezeTimer) clearTimeout(simFreezeTimer);
+    const sim = simulation;
+    simFreezeTimer = setTimeout(() => {
+        if (simulation === sim) sim.stop();
+    }, SIM_FREEZE_MS);
+}
+
 function initSimulation(simNodes) {
     if (simulation) simulation.stop();
+    if (simFreezeTimer) clearTimeout(simFreezeTimer);
 
     simulation = d3.forceSimulation(simNodes)
-        .force('x',       d3.forceX(d => getCentroid(d.group)[0]).strength(0.3))
-        .force('y',       d3.forceY(d => getCentroid(d.group)[1]).strength(0.3))
+        .force('x',       d3.forceX(d => getCentroid(d)[0]).strength(0.3))
+        .force('y',       d3.forceY(d => getCentroid(d)[1]).strength(0.3))
         .force('collide', d3.forceCollide(d => d.simRadius).strength(0.9).iterations(3))
         .force('cmRepel', makeCmRepulsion(simNodes))
         .on('tick', () => {
             simNodes.forEach(d => d._g.attr('transform', `translate(${d.x},${d.y})`));
         });
+
+    armFreezeTimer();
 }
 
 function updateSimForces() {
     if (!simulation) return;
     simulation
-        .force('x', d3.forceX(d => getCentroid(d.group)[0]).strength(0.3))
-        .force('y', d3.forceY(d => getCentroid(d.group)[1]).strength(0.3))
+        .force('x', d3.forceX(d => getCentroid(d)[0]).strength(0.3))
+        .force('y', d3.forceY(d => getCentroid(d)[1]).strength(0.3))
         .alpha(0.3).restart();
+
+    armFreezeTimer();
 }
 
 // ── Popup ─────────────────────────────────────────────────────────────────────
