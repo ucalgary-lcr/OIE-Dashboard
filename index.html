@@ -36,11 +36,24 @@
         top: 50%;
         left: 50%;
         transform: translate(-50%, -50%);
-        width: min(62vw, 300px);
+        width: min(81vw, 390px);
         opacity: 0.45;
         pointer-events: none;
         z-index: 0;
     }
+
+    /* Mobile-only progress legend, pinned to the bottom of the viewport so
+       it's always visible while the page scrolls underneath. */
+    #legendDock {
+        display: none;
+        position: fixed;
+        bottom: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 5;
+        pointer-events: none;
+    }
+    #legendDock svg { width: auto; height: auto; }
 
     .shadow {
         filter: drop-shadow(0px 0px 2px rgba(0,0,0,.6));
@@ -74,6 +87,8 @@
 <div id="container"></div>
 
 <img id="cmWatermark" src="./culturalmodel.png" alt="" aria-hidden="true">
+
+<div id="legendDock"><svg></svg></div>
 
 <div id="popupcontext">
     <div>
@@ -113,15 +128,25 @@ const ICON_ASPECT = {
 // ── Size constants ──────────────────────────────────────────────────────────
 const RADIUS         = 44;
 // B1/B2's 4 children sit in a 2×2 grid (see gridLayoutChildren) sized at
-// RADIUS each, matching regular leaf nodes. CONTAINER_RAD is derived — not
+// SUB_RADIUS each — slightly larger than regular leaf nodes so they carry the
+// same label font sizes comfortably. CONTAINER_RAD is derived — not
 // hardcoded — so the outer ring just hugs that grid (diagonal centre-to-far-
 // edge distance) plus a fixed clearance, rather than being arbitrarily huge.
+// The B1/B2 label sits inside the ring, in the gap above the top two children.
+const SUB_RADIUS      = 48;
 const SUPER_CHILD_GAP = 6;     // gap between adjacent B1/B2 children
 const SUPER_MARGIN    = 20;    // clearance between children and the outer ring
-const CONTAINER_RAD   = Math.SQRT2 * (RADIUS + SUPER_CHILD_GAP / 2) + RADIUS + SUPER_MARGIN;  // ~130px
-const CONTAINER_DIAM  = CONTAINER_RAD * 2;                                                    // ~261px
-const CM_FIXED_W     = 320;                    // cultural model image: always this wide
-const CM_REPEL_R     = 155;                    // cultural model exclusion zone radius
+const CONTAINER_RAD   = Math.SQRT2 * (SUB_RADIUS + SUPER_CHILD_GAP / 2) + SUB_RADIUS + SUPER_MARGIN;  // ~140px
+const CONTAINER_DIAM  = CONTAINER_RAD * 2;                                                            // ~280px
+const CM_MAX_W       = 480;                    // cultural model image width on full-size screens
+const CM_ASPECT      = 767 / 1358;             // culturalmodel.png height ÷ width
+const FILL_ANIM_MS    = 1400;                  // progress fill rise duration
+const FILL_DELAY_MS   = 300;                   // pause before the first node starts filling
+const FILL_STAGGER_MS = 30;                    // extra delay per node, so they ripple in
+const CONTAINER_OPACITY = 0.3;                 // B1/B2 outer ring (fill + border)
+const LOGO_EDGE_MARGIN = 28;                   // desktop corner header plates: plate edge to viewport edge
+const LEGEND_W       = 250;                    // progress legend box (desktop bottom-right)
+const LEGEND_H       = 92;
 const DESKTOP_BREAK  = 1200;                   // px — switch to mobile layout below this
 const LAYOUT_SEED    = 42;                     // fixed seed — same starting layout every load
 const SIM_FREEZE_MS  = 2000;                   // stop the force simulation after this long
@@ -156,10 +181,15 @@ let currentMode = null;   // 'desktop' | 'mobile'
 let simulation, csvData;
 let simFreezeTimer = null;   // pending "stop the simulation" timeout
 let popupopen = false;
+let doingLogoLeft = null; // left edge of the desktop "Ways of Doing" logo — the legend sits beside it
 
 // ── SVG scaffold ────────────────────────────────────────────────────────────
 const containerEl   = document.getElementById('container');
 const cmWatermarkEl = document.getElementById('cmWatermark');
+const legendDockEl  = document.getElementById('legendDock');
+const legendDockSvg = d3.select('#legendDock svg')
+    .attr('width', LEGEND_W).attr('height', LEGEND_H)
+    .attr('viewBox', `0 0 ${LEGEND_W} ${LEGEND_H}`);
 const svg         = d3.select('#container').append('svg');
 const svgNode     = svg.node();
 const rc          = rough.svg(svgNode);
@@ -174,6 +204,11 @@ function getDims() {
 }
 
 function isDesktop() { return W >= DESKTOP_BREAK; }
+
+// Cultural model width — full size normally, scaled down on short screens
+// (e.g. 1280×720) so it doesn't crowd B1 off the top edge.
+function cmWidth()   { return Math.min(CM_MAX_W, H * 0.5); }
+function cmYOffset() { return cmWidth() * 0.55; }   // image top sits this far above screen centre
 
 function getColour(rec, dark) {
     const idx = { B: 0, C: 1, D: 2, K: 3 }[rec.charAt(0)];
@@ -232,7 +267,8 @@ function computeMobileBands() {
         result._bands.push({ group: b.group, ...result[b.group] });
         y += b.h;
     });
-    result._totalH = y + 50;
+    // Room at the end so the last nodes can scroll clear of the fixed legend
+    result._totalH = y + LEGEND_H + 30;
     return result;
 }
 
@@ -245,12 +281,14 @@ function applyLayoutMode(mode) {
         containerEl.style.height      = totalH + 'px';
         svgNode.style.height          = totalH + 'px';
         cmWatermarkEl.style.display   = 'block';
+        legendDockEl.style.display    = 'block';
     } else {
         document.body.style.overflowY = 'hidden';
         document.body.style.overflowX = 'hidden';
         containerEl.style.height      = '100vh';
         svgNode.style.height          = '100%';
         cmWatermarkEl.style.display   = 'none';
+        legendDockEl.style.display    = 'none';
     }
 }
 
@@ -258,6 +296,7 @@ function applyLayoutMode(mode) {
 function drawStaticGraphics() {
     staticLayer.selectAll('*').remove();
     topLayer.selectAll('*').remove();
+    legendDockSvg.selectAll('*').remove();
     defs.selectAll('filter').remove();
 
     if (isDesktop()) {
@@ -271,43 +310,104 @@ function drawDesktopStatics() {
     // Cultural model — fixed pixel size, centred
     staticLayer.append('image')
         .attr('href', './culturalmodel.png')
-        .attr('width',  CM_FIXED_W)
+        .attr('width',  cmWidth())
+        .attr('height', cmWidth() * CM_ASPECT)
         .attr('class',  'shadow')
-        .attr('x',  (W - CM_FIXED_W) / 2)
-        .attr('y',   H / 2 - CM_FIXED_W * 0.55);
+        .attr('x',  (W - cmWidth()) / 2)
+        .attr('y',   H / 2 - cmYOffset());
 
-    // Corner logos — image and text both centred under the group icon
-    const lw     = Math.min(72, W * 0.054);
-    const inset  = 20;   // pulls the logos in from the raw viewport edge
+    // Corner headers — same glowing plate as the mobile band headers, with
+    // the label wrapped onto two lines. Plate edges sit LOGO_EDGE_MARGIN in
+    // from the viewport edges.
     const logos = [
-        { label: 'Ways of Being',      file: 'circle being.png',      tx: 18 + inset,          ty: 10 + inset,      col: darkcolours[0], fid: 'fdsB' },
-        { label: 'Ways of Connecting', file: 'circle connecting.png',  tx: 18 + inset,          ty: H - 108 - inset, col: darkcolours[1], fid: 'fdsC' },
-        { label: 'Ways of Doing',      file: 'circle doing.png',       tx: W - lw - 18 - inset, ty: H - 108 - inset, col: darkcolours[2], fid: 'fdsD' },
-        { label: 'Ways of Knowing',    file: 'circle knowing.png',     tx: W - lw - 18 - inset, ty: 10 + inset,      col: darkcolours[3], fid: 'fdsK' },
+        { label: 'Ways of Being',      file: 'circle being.png',      h: 'left',  v: 'top',    col: darkcolours[0], fid: 'fdsB' },
+        { label: 'Ways of Connecting', file: 'circle connecting.png', h: 'left',  v: 'bottom', col: darkcolours[1], fid: 'fdsC' },
+        { label: 'Ways of Doing',      file: 'circle doing.png',      h: 'right', v: 'bottom', col: darkcolours[2], fid: 'fdsD' },
+        { label: 'Ways of Knowing',    file: 'circle knowing.png',    h: 'right', v: 'top',    col: darkcolours[3], fid: 'fdsK' },
     ];
 
-    logos.forEach(({ label, file, tx, ty, col, fid }) => {
-        defs.append('filter').attr('id', fid)
-            .append('feDropShadow')
-            .attr('dx', 1).attr('dy', 1).attr('stdDeviation', 6)
-            .attr('flood-opacity', 1).attr('flood-color', col);
+    logos.forEach(({ label, file, h, v, col, fid }) => {
+        const plate = drawLabelPlate(staticLayer, { label, file, col, fid, iconW: 60, wrapped: true });
+        const x = h === 'left' ? LOGO_EDGE_MARGIN : W - LOGO_EDGE_MARGIN - plate.w;
+        const y = v === 'top'  ? LOGO_EDGE_MARGIN : H - LOGO_EDGE_MARGIN - plate.h;
+        plate.g.attr('transform', `translate(${x},${y})`);
+        if (label === 'Ways of Doing') doingLogoLeft = x;
+    });
 
-        const g = staticLayer.append('g')
-            .attr('filter', `url(#${fid})`)
-            .attr('transform', `translate(${tx},${ty})`);
+    // Progress legend — bottom-right, just left of the "Ways of Doing" logo
+    const [lx, ly] = legendOrigin();
+    drawLegend(topLayer, lx, ly);
+}
 
-        // Image anchored at x=0; centre is lw/2
-        g.append('image').attr('href', `./${file}`)
-            .attr('width', lw).attr('height', lw * ICON_ASPECT[file]);
+// Top-left corner of the desktop legend box. (On mobile the legend lives in
+// the fixed #legendDock instead — see drawMobileStatics.)
+function legendOrigin() {
+    // Just left of the "Ways of Doing" logo (measured when it was drawn)
+    const right = doingLogoLeft ?? (W - LOGO_EDGE_MARGIN - 150);
+    return [right - 30 - LEGEND_W, H - LEGEND_H - 20];
+}
 
-        // Text centred under the image — sized to match the mobile band headers
+// Legend explaining that the darker fill rising from the bottom of each
+// circle shows progress. Drawn above the nodes so they never cover it.
+function drawLegend(layer, x, y) {
+    const g = layer.append('g')
+        .attr('class', 'legend')
+        .attr('transform', `translate(${x},${y})`);
+
+    g.append('rect')
+        .attr('width', LEGEND_W).attr('height', LEGEND_H)
+        .attr('rx', 10)
+        .attr('fill', 'rgba(253,250,246,0.9)');
+
+    g.append('text')
+        .text('Progress')
+        .attr('x', LEGEND_W / 2).attr('y', 20)
+        .attr('fill', '#444')
+        .attr('font-size', '11pt').attr('font-weight', 'bold')
+        .attr('text-anchor', 'middle');
+
+    const r     = 14;
+    const cy    = 46;
+    const steps = [0, 50, 100];
+    const xs    = steps.map((_, i) => LEGEND_W * (i + 1) / (steps.length + 1));
+
+    // Arrow behind the circles: "more fill → more progress"
+    g.append('line')
+        .attr('x1', xs[0] + r + 6).attr('x2', xs[2] - r - 8)
+        .attr('y1', cy).attr('y2', cy)
+        .attr('stroke', '#999').attr('stroke-width', 1.5)
+        .attr('marker-end', 'url(#legendArrow)');
+    defs.selectAll('#legendArrow').remove();
+    defs.append('marker').attr('id', 'legendArrow')
+        .attr('viewBox', '0 0 10 10').attr('refX', 8).attr('refY', 5)
+        .attr('markerWidth', 6).attr('markerHeight', 6).attr('orient', 'auto')
+        .append('path').attr('d', 'M0,0 L10,5 L0,10 z').attr('fill', '#999');
+
+    steps.forEach((pct, i) => {
+        const cx = xs[i];
+        // Same technique as the real nodes: dark base, light overlay clipped
+        // to the un-progressed top portion.
+        g.node().appendChild(rc.circle(cx, cy, r * 2, {
+            seed: 300 + i, roughness: 0.4, strokeWidth: 1.2,
+            fill: '#4A4A4A', fillStyle: 'solid'
+        }));
+        const clipId = 'clip-legend-' + i;
+        defs.selectAll('#' + clipId).remove();
+        defs.append('clipPath').attr('id', clipId)
+            .append('rect')
+            .attr('x', cx - r).attr('y', cy - r)
+            .attr('width', r * 2).attr('height', (100 - pct) / 100 * r * 2);
+        const top = rc.circle(cx, cy, r * 2, {
+            seed: 300 + i, roughness: 0.4, strokeWidth: 1.2,
+            fill: '#C4C4C4', fillStyle: 'solid'
+        });
+        top.setAttribute('clip-path', `url(#${clipId})`);
+        g.node().appendChild(top);
+
         g.append('text')
-            .text(label)
-            .attr('x',    lw / 2)
-            .attr('y',    lw + 18)
-            .attr('fill', col)
-            .attr('font-size',   '13pt')
-            .attr('font-weight', 'bold')
+            .text(pct + '%')
+            .attr('x', cx).attr('y', cy + r + 16)
+            .attr('fill', '#444').attr('font-size', '9pt')
             .attr('text-anchor', 'middle');
     });
 }
@@ -332,56 +432,85 @@ function drawMobileStatics() {
         // hybrid state on its own, so it just hangs in the gap between bands.
         if (band.label) addMobileHeader(band);
     });
+
+    // Legend pinned to the bottom of the viewport, so it's always visible
+    drawLegend(legendDockSvg, 0, 0);
 }
 
-// Band header — icon + label, left-aligned, on an opaque plate, drawn in
-// topLayer so it always sits above any node that scrolls underneath it.
-// Glows in the section's colour, matching the desktop corner headers.
-function addMobileHeader(band) {
-    const iconW     = Math.min(64, W * 0.16);
-    const iconH     = iconW * ICON_ASPECT[band.file];
-    const padLeft   = 16;
-    const headerCY  = band.top + iconH / 2 + 14;
+// "Ways of …" header plate — icon + label on a rounded, opaque plate that
+// glows in the section's colour. Shared by the desktop corner headers and
+// the mobile band headers. Drawn with the plate's top-left at local (0, 0);
+// the caller positions it via the returned { g, w, h }.
+// `wrapped` puts "Ways of" on the first line and the section word below.
+function drawLabelPlate(layer, { label, file, col, fid, iconW, wrapped }) {
+    const iconH = iconW * ICON_ASPECT[file];
+    const padX = 8, padY = 10;   // plate padding around the icon + text
 
-    const fid = 'fdsMobile' + band.group;
     defs.append('filter').attr('id', fid)
         .append('feDropShadow')
         .attr('dx', 1).attr('dy', 1).attr('stdDeviation', 6)
-        .attr('flood-opacity', 1).attr('flood-color', band.col);
+        .attr('flood-opacity', 1).attr('flood-color', col);
 
-    const g = topLayer.append('g')
-        .attr('class', 'mobile-header')
+    const g = layer.append('g')
+        .attr('class', 'label-plate')
         .attr('filter', `url(#${fid})`);
 
     g.append('image')
-        .attr('href', `./${band.file}`)
+        .attr('href', `./${file}`)
         .attr('width', iconW).attr('height', iconH)
-        .attr('x', padLeft)
-        .attr('y', headerCY - iconH / 2);
+        .attr('x', 0).attr('y', -iconH / 2);
 
-    g.append('text')
-        .text(band.label)
-        .attr('x', padLeft + iconW + 10)
-        .attr('y', headerCY + 5)
-        .attr('fill', band.col)
+    // Text vertically centred on the icon (local y = 0)
+    const text = g.append('text')
+        .attr('y', 0)
+        .attr('fill', col)
         .attr('font-size',   '13pt')
         .attr('font-weight', 'bold')
         .attr('text-anchor', 'start');
+    const tx    = iconW + 10;
+    const lines = wrapped ? ['Ways of', label.replace(/^Ways of\s+/, '')] : [label];
+    const lh    = 1.15;   // line height, em
+    const tspans = lines.map((line, i) => text.append('tspan')
+        .text(line)
+        .attr('x', tx)
+        .attr('dy', (i === 0 ? 0.35 - (lines.length - 1) * lh / 2 : lh) + 'em'));
+
+    // Wrapped lines are centred on each other, within the column beside the icon
+    if (lines.length > 1) {
+        const colW = Math.max(...tspans.map(t => t.node().getComputedTextLength()));
+        text.attr('text-anchor', 'middle');
+        tspans.forEach(t => t.attr('x', tx + colW / 2));
+    }
 
     // Opaque backing plate sized to fit the icon + text, inserted behind them
-    const bbox  = g.node().getBBox();
-    const padX  = 14, padY = 10;
-    const plateX = bbox.x - padX,          plateY = bbox.y - padY;
-    const plateW = bbox.width + padX * 2,  plateH = bbox.height + padY * 2;
+    const bbox = g.node().getBBox();
+    const w = bbox.width + padX * 2, h = bbox.height + padY * 2;
 
     const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    rect.setAttribute('x', plateX);
-    rect.setAttribute('y', plateY);
-    rect.setAttribute('width',  plateW);
-    rect.setAttribute('height', plateH);
+    rect.setAttribute('x', bbox.x - padX);
+    rect.setAttribute('y', bbox.y - padY);
+    rect.setAttribute('width',  w);
+    rect.setAttribute('height', h);
     rect.setAttribute('rx', 10);
-    rect.setAttribute('fill', 'rgba(253,250,246,0.85)');
+    rect.setAttribute('fill', 'rgba(253,250,246,0.55)');   // see-through enough to show nodes beneath
     g.node().insertBefore(rect, g.node().firstChild);
+
+    // Shift contents so the plate's top-left is at (0, 0)
+    const inner = d3.select(g.node()).selectAll(':scope > *');
+    inner.attr('transform', `translate(${padX - bbox.x},${padY - bbox.y})`);
+    return { g, w, h };
+}
+
+// Band header — drawn in topLayer so it always sits above any node that
+// scrolls underneath it.
+function addMobileHeader(band) {
+    const plateMargin = 20;   // plate edge to viewport edge — leaves room for the glow
+    const { g } = drawLabelPlate(topLayer, {
+        label: band.label, file: band.file, col: band.col,
+        fid: 'fdsMobile' + band.group, iconW: Math.min(64, W * 0.16), wrapped: true,
+    });
+    g.classed('mobile-header', true)
+        .attr('transform', `translate(${plateMargin},${band.top + 4})`);
 }
 
 // ── Build simulation nodes from CSV ─────────────────────────────────────────
@@ -456,10 +585,11 @@ function drawRegularNode(simNode, g) {
     const fillFrac = Math.max(((100 - parseFloat(row.Amount) - 4) / 100), 0);
     const fillH    = fillFrac * RADIUS * 2;
 
-    defs.append('clipPath').attr('id', 'clip' + simNode.id)
+    const clipRects = [];
+    clipRects.push(defs.append('clipPath').attr('id', 'clip' + simNode.id)
         .append('rect')
         .attr('x', -RADIUS).attr('y', -RADIUS)
-        .attr('width', RADIUS * 2).attr('height', fillH);
+        .attr('width', RADIUS * 2).attr('height', fillH));
 
     const fillEl = rc.circle(0, 0, diam, {
         seed: idx, roughness: 0.4, strokeWidth: 1.5,
@@ -471,13 +601,10 @@ function drawRegularNode(simNode, g) {
     // Fill-level indicator — right half, C2/D4 only
     if (split) {
         const other = row.Recommendation.split('/')[1].trim();
-        const p = d3.path();
-        p.moveTo(0, -RADIUS); p.lineTo(RADIUS, -RADIUS);
-        p.lineTo(RADIUS, -RADIUS + fillH); p.lineTo(0, -RADIUS + fillH);
-        p.closePath();
-
-        defs.append('clipPath').attr('id', 'clip34' + simNode.id)
-            .append('path').attr('d', p.toString());
+        clipRects.push(defs.append('clipPath').attr('id', 'clip34' + simNode.id)
+            .append('rect')
+            .attr('x', 0).attr('y', -RADIUS)
+            .attr('width', RADIUS).attr('height', fillH));
 
         const fillEl2 = rc.circle(0, 0, diam, {
             seed: idx, roughness: 0.4, strokeWidth: 1.5,
@@ -486,6 +613,8 @@ function drawRegularNode(simNode, g) {
         fillEl2.setAttribute('clip-path', 'url(#clip34' + simNode.id + ')');
         g.node().appendChild(attach(fillEl2));
     }
+
+    animateFill(RADIUS, fillH, idx, clipRects);
 
     // Labels
     g.append('text')
@@ -509,6 +638,23 @@ function drawRegularNode(simNode, g) {
     }
 }
 
+// ── Progress fill: fill-on-load animation ──────────────────────────────────
+// Each circle is a dark (progress) base with a light overlay clipped to the
+// top `lightH` pixels. We animate that clip from covering the whole circle
+// (empty) down to its real depth, so the dark colour appears to rise.
+function animateFill(r, lightH, order, clipRects) {
+    const setH = h => clipRects.forEach(c => c.attr('height', h));
+    setH(r * 2);                                                 // start empty
+    const interp = d3.interpolateNumber(r * 2, lightH);
+    // Bound to this circle's own clip rect — B1/B2's children share one <g>,
+    // and same-element transitions would cancel each other.
+    clipRects[0].transition('fill')
+        .delay(FILL_DELAY_MS + order * FILL_STAGGER_MS)
+        .duration(FILL_ANIM_MS)
+        .ease(d3.easeCubicInOut)
+        .tween('fill', () => t => setH(interp(t)));
+}
+
 // Arrange a super-node's children in a compact square grid, centred on
 // (0, 0). Far more area-efficient than d3.pack's circular packing for a
 // handful of equal-sized circles — pack inscribes them in a circle and
@@ -529,14 +675,16 @@ function gridLayoutChildren(children, r, gap) {
 
 // ── Draw B1/B2 super-node into <g> at local (0, 0) ──────────────────────────
 function drawSuperNode(simNode, g) {
-    // Outer container circle
-    g.node().appendChild(rc.circle(0, 0, CONTAINER_DIAM, {
+    // Outer container circle — semi-transparent (fill and border together)
+    const ring = rc.circle(0, 0, CONTAINER_DIAM, {
         seed: simNode.id === 'B1' ? 200 : 201,
         roughness: 0.3, strokeWidth: 2,
         fill: containercolour, fillStyle: 'solid'
-    }));
+    });
+    ring.setAttribute('opacity', CONTAINER_OPACITY);
+    g.node().appendChild(ring);
 
-    const packedChildren = gridLayoutChildren(simNode.children, RADIUS, SUPER_CHILD_GAP);
+    const packedChildren = gridLayoutChildren(simNode.children, SUB_RADIUS, SUPER_CHILD_GAP);
 
     packedChildren.forEach(child => {
         const cx       = child.x;
@@ -562,7 +710,7 @@ function drawSuperNode(simNode, g) {
         const sfillH = sfrac * cr * 2;
         const clipId = 'clip-sub-' + childRow.id;
 
-        defs.append('clipPath').attr('id', clipId)
+        const sclip = defs.append('clipPath').attr('id', clipId)
             .append('rect')
             .attr('x', cx - cr).attr('y', cy - cr)
             .attr('width', cr * 2).attr('height', sfillH);
@@ -574,12 +722,14 @@ function drawSuperNode(simNode, g) {
         sfillEl.setAttribute('clip-path', `url(#${clipId})`);
         g.node().appendChild(attachChild(sfillEl));
 
-        // Sub-node labels
+        animateFill(cr, sfillH, cidx, [sclip]);
+
+        // Sub-node labels — same sizes/styling as regular leaf nodes
         g.append('text')
             .text(childRow.id)
-            .attr('x', cx).attr('y', cy - cr + 13)
-            .attr('fill', 'white')
-            .attr('font-size', '8pt').attr('font-weight', 'bold')
+            .attr('x', cx).attr('y', cy - cr + 22)
+            .attr('class', 'shadow').attr('fill', 'white')
+            .attr('font-size', '12pt').attr('font-weight', 'bold')
             .attr('text-anchor', 'middle')
             .attr('data-idx', cidx)
             .on('pointerenter', popup).on('pointerleave', popupclose);
@@ -587,20 +737,21 @@ function drawSuperNode(simNode, g) {
         if (childRow.Label !== 'X') {
             g.append('text')
                 .text(childRow.Label)
-                .attr('x', cx).attr('y', cy + 2)
-                .attr('fill', 'white').attr('font-size', '7pt')
-                .attr('text-anchor', 'middle')
+                .attr('x', cx).attr('y', cy + 4)
+                .attr('class', 'shadow').attr('fill', 'white')
+                .attr('font-size', '9pt').attr('text-anchor', 'middle')
                 .attr('data-idx', cidx)
                 .on('pointerenter', popup).on('pointerleave', popupclose)
-                .call(wrap, cr * 1.6, 0.35, 1.05, 0.95);
+                .call(wrap, cr * 1.8, 0.35, 1.05, 0.99);
         }
     });
 
-    // Super-node ID label — shifted above the ring instead of stealing
-    // headroom from inside it, so the children can use the full circle.
+    // Super-node ID label — inside the ring, in the open wedge above the
+    // gap between the top two children. Dark text, since white would wash
+    // out against the now-translucent ring.
     g.append('text')
         .text(simNode.id)
-        .attr('x', 0).attr('y', -CONTAINER_RAD - 12)
+        .attr('x', 0).attr('y', -CONTAINER_RAD + 30)
         .attr('fill', containercolour)
         .attr('font-size', '12pt').attr('font-weight', 'bold')
         .attr('text-anchor', 'middle');
@@ -609,7 +760,7 @@ function drawSuperNode(simNode, g) {
 // ── Create all node <g> groups ───────────────────────────────────────────────
 function initNodes(simNodes) {
     nodeLayer.selectAll('*').remove();
-    defs.selectAll('clipPath').remove();
+    defs.selectAll('clipPath:not([id^="clip-legend"])').remove();   // legend clips belong to the statics
 
     simNodes.forEach(simNode => {
         const g = nodeLayer.append('g')
@@ -619,19 +770,35 @@ function initNodes(simNodes) {
     });
 }
 
-// ── Cultural-model repulsion (desktop only) ──────────────────────────────────
+// ── Cultural-model + legend repulsion (desktop only) ─────────────────────────
 function makeCmRepulsion(nodes) {
     return function(alpha) {
         if (!isDesktop()) return;
-        const cx = W / 2, cy = H / 2;
+        const [lx, ly] = legendOrigin();
+        // Elliptical keep-out zones (half-widths rx, ry) around the wide
+        // cultural model image and the legend box.
+        const cmW   = cmWidth(), cmH = cmW * CM_ASPECT;
+        const zones = [
+            { cx: W / 2, cy: H / 2 - cmYOffset() + cmH / 2, rx: cmW / 2, ry: cmH / 2 },
+            { cx: lx + LEGEND_W / 2, cy: ly + LEGEND_H / 2, rx: LEGEND_W / 2, ry: LEGEND_H / 2 },
+        ];
         for (const n of nodes) {
-            const dx = n.x - cx, dy = n.y - cy;
-            const d  = Math.hypot(dx, dy) || 1;
-            if (d < CM_REPEL_R) {
-                const push = ((CM_REPEL_R - d) / CM_REPEL_R) * alpha * 5;
-                n.vx += (dx / d) * push;
-                n.vy += (dy / d) * push;
+            const nr = n.isSuper ? CONTAINER_RAD : RADIUS;   // keep the node's edge out, not just its centre
+            for (const z of zones) {
+                const rx = z.rx + nr * 0.8, ry = z.ry + nr * 0.8;
+                const dx = n.x - z.cx, dy = n.y - z.cy;
+                const d  = Math.hypot(dx / rx, dy / ry) || 0.01;   // < 1 means inside the ellipse
+                if (d < 1) {
+                    const push = (1 - d) * alpha * 60;
+                    const len  = Math.hypot(dx, dy) || 1;
+                    n.vx += (dx / len) * push;
+                    n.vy += (dy / len) * push;
+                }
             }
+            // Keep every node fully on screen (short laptop screens crowd B1 off the top)
+            const m = nr + 8;
+            n.x = Math.max(m, Math.min(W - m, n.x));
+            n.y = Math.max(m, Math.min(H - m, n.y));
         }
     };
 }
@@ -757,6 +924,10 @@ async function init() {
 
     rebuild();
     d3.select('#popupcontext').on('pointerleave', popupclose);
+
+    // Corner-logo positions are measured from label widths — re-measure once
+    // IBM Plex has loaded, since the fallback font has different widths.
+    document.fonts.ready.then(drawStaticGraphics);
 }
 
 // ── Resize observer ────────────────────────────────────────────────────────
